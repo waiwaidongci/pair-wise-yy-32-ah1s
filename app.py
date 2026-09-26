@@ -13,18 +13,38 @@ from urllib.parse import urlparse
 
 DB_PATH = Path(__file__).with_name("data.db")
 
+TERMINAL_STATES = {"released", "rejected", "revoked"}
+SIGNAL_TYPES = {"retest_failure", "stability_oor", "other"}
+ASSESS_ACTIONS = {"maintain", "investigate", "revoke"}
+
+BATCHES_DDL = """
+CREATE TABLE IF NOT EXISTS batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, factory_id INTEGER NOT NULL REFERENCES factories(id),
+  batch_no TEXT NOT NULL, product TEXT NOT NULL, mfg_date TEXT NOT NULL, expiry_date TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('manufactured','investigation','awaiting_resample','conditional','released','rejected','revoked')),
+  revision INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE(factory_id,batch_no)
+);
+"""
+
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def after_now(value: str | None = None) -> bool:
+def parse_time(value: str | None) -> datetime | None:
     if not value:
-        return False
+        return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")) > datetime.now(timezone.utc)
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
-        return False
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def after_now(value: str | None = None) -> bool:
+    stamp = parse_time(value)
+    return bool(stamp and stamp > datetime.now(timezone.utc))
 
 
 def j(value: object) -> str:
@@ -47,13 +67,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS factories (
           id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL, country TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS batches (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, factory_id INTEGER NOT NULL REFERENCES factories(id),
-          batch_no TEXT NOT NULL, product TEXT NOT NULL, mfg_date TEXT NOT NULL, expiry_date TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('manufactured','investigation','awaiting_resample','conditional','released','rejected')),
-          revision INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          UNIQUE(factory_id,batch_no)
-        );
+        """ + BATCHES_DDL + """
         CREATE TABLE IF NOT EXISTS deviations (
           id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER NOT NULL REFERENCES batches(id),
           severity TEXT NOT NULL CHECK(severity IN ('critical','minor')), title TEXT NOT NULL, due_at TEXT,
@@ -84,14 +98,40 @@ class Store:
         CREATE TABLE IF NOT EXISTS decisions (
           id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER NOT NULL REFERENCES batches(id), revision INTEGER NOT NULL,
           decision TEXT NOT NULL CHECK(decision IN ('release','reject','conditional','resample')), rationale TEXT NOT NULL,
-          exception_code TEXT, decided_by TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(batch_id,revision)
+          exception_code TEXT, decided_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          voided_by TEXT, voided_at TEXT, void_reason TEXT, UNIQUE(batch_id,revision)
+        );
+        CREATE TABLE IF NOT EXISTS quality_signals (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER NOT NULL REFERENCES batches(id),
+          signal_type TEXT NOT NULL CHECK(signal_type IN ('retest_failure','stability_oor','other')),
+          source TEXT NOT NULL, discovered_at TEXT NOT NULL, impact TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('pending','assessed')) DEFAULT 'pending',
+          assessment TEXT CHECK(assessment IN ('maintain','investigate','revoke')),
+          assessment_reason TEXT, assessed_by TEXT, assessed_at TEXT,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS audit_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
         """)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        ddl = self.conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='batches'").fetchone()
+        if ddl and "'revoked'" not in ddl["sql"]:
+            self.conn.execute("PRAGMA foreign_keys=OFF")
+            self.conn.executescript(BATCHES_DDL.replace("TABLE IF NOT EXISTS batches", "TABLE batches_new") + """
+            INSERT INTO batches_new SELECT * FROM batches;
+            DROP TABLE batches;
+            ALTER TABLE batches_new RENAME TO batches;
+            """)
+            self.conn.execute("PRAGMA foreign_keys=ON")
+        existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(decisions)")}
+        for column in ("voided_by", "voided_at", "void_reason"):
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE decisions ADD COLUMN {column} TEXT")
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
         self.conn.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?,?)",
@@ -149,7 +189,7 @@ class BatchService:
         actor = self._actor(actor, role, {"operator", "inspector"})
         batch = self._row("batches", batch_id); self._factory_check(actor, factory_id, batch)
         if severity not in {"critical", "minor"} or not title.strip(): raise ApiError(400, "偏差等级或描述不合法")
-        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "已终态批次不能新增偏差")
+        if batch["state"] in TERMINAL_STATES: raise ApiError(409, "已终态批次不能新增偏差")
         with self.conn:
             cur = self.conn.execute("""INSERT INTO deviations(batch_id,severity,title,due_at,status,created_by,created_at)
                                      VALUES(?,?,?,?,'open',?,?)""", (batch_id, severity, title, due_at, actor, now()))
@@ -184,7 +224,7 @@ class BatchService:
         actor = self._actor(actor, role, {"lab"})
         batch = self._row("batches", batch_id); self._factory_check(actor, factory_id, batch)
         if not test_type.strip() or spec_min > spec_max: raise ApiError(400, "检验项目或标准不合法")
-        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "终态批次不能补录检验")
+        if batch["state"] in TERMINAL_STATES: raise ApiError(409, "终态批次不能补录检验")
         round_no = self.conn.execute("SELECT COALESCE(MAX(round),0)+1 FROM tests WHERE batch_id=? AND test_type=?", (batch_id, test_type)).fetchone()[0]
         passed = int(spec_min <= result <= spec_max)
         with self.conn:
@@ -197,7 +237,7 @@ class BatchService:
     def plan_rework(self, actor: str | None, role: str | None, factory_id: int, batch_id: int, description: str, expected_revision: int) -> dict:
         actor = self._actor(actor, role, {"operator"})
         batch = self._row("batches", batch_id); self._factory_check(actor, factory_id, batch)
-        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "终态批次不能返工")
+        if batch["state"] in TERMINAL_STATES: raise ApiError(409, "终态批次不能返工")
         with self.conn:
             cur = self.conn.execute("INSERT INTO rework(batch_id,description,status,created_by,created_at) VALUES(?,?,'planned',?,?)", (batch_id, description, actor, now()))
             self._advance_batch(batch_id, expected_revision, "investigation")
@@ -239,9 +279,11 @@ class BatchService:
         actor = self._actor(actor, role, {"qa"})
         batch = self._row("batches", batch_id)
         if decision not in {"release", "reject", "conditional", "resample"}: raise ApiError(400, "放行决定不合法")
-        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "批次已经是终态")
+        if batch["state"] in TERMINAL_STATES: raise ApiError(409, "批次已经是终态")
         if int(expected_revision) != int(batch["revision"]): raise ApiError(409, "批次已被其他工厂或质量人员修改，请刷新版本")
         if not rationale.strip(): raise ApiError(400, "必须填写决定依据")
+        if self.conn.execute("SELECT 1 FROM quality_signals WHERE batch_id=? AND status='pending' LIMIT 1", (batch_id,)).fetchone():
+            raise ApiError(409, "存在待评估的上市后质量信号，批次已冻结，请先完成复评")
         deviations = self.conn.execute("SELECT * FROM deviations WHERE batch_id=? ORDER BY id", (batch_id,)).fetchall()
         open_deviations = [d for d in deviations if d["status"] == "open"]
         latest_tests: dict[str, sqlite3.Row] = {}
@@ -277,20 +319,81 @@ class BatchService:
             self.store.audit(actor, "batch.decision", "batch", batch_id, {"decision": decision, "revision": batch["revision"], "state": new_state, "exception_code": exception_code})
         return {"decision": dict(self._row("decisions", cur.lastrowid)), "batch": self.batch_detail(batch_id)["batch"]}
 
+    def register_signal(self, actor: str | None, role: str | None, batch_id: int, signal_type: str, source: str, discovered_at: str, impact: str, expected_revision: int) -> dict:
+        actor = self._actor(actor, role, {"qa"})
+        batch = self._row("batches", batch_id)
+        if batch["state"] != "released": raise ApiError(409, "只有正式放行的批次才能登记上市后质量信号")
+        if signal_type not in SIGNAL_TYPES: raise ApiError(400, "信号类型不合法")
+        if not source.strip() or not impact.strip(): raise ApiError(400, "信号来源和影响说明不能为空")
+        discovered = parse_time(discovered_at)
+        if not discovered: raise ApiError(400, "发现时间不合法")
+        if discovered > datetime.now(timezone.utc): raise ApiError(400, "发现时间不能晚于当前时间")
+        with self.conn:
+            cur = self.conn.execute("""INSERT INTO quality_signals(batch_id,signal_type,source,discovered_at,impact,status,created_by,created_at)
+                                     VALUES(?,?,?,?,?,'pending',?,?)""",
+                                    (batch_id, signal_type, source, discovered_at, impact, actor, now()))
+            self._touch_batch(batch_id, expected_revision)
+            self.store.audit(actor, "signal.register", "signal", cur.lastrowid,
+                             {"batch_id": batch_id, "signal_type": signal_type, "source": source})
+        return self._signal_dict(self._row("quality_signals", cur.lastrowid))
+
+    def assess_signal(self, actor: str | None, role: str | None, signal_id: int, action: str, reason: str, expected_revision: int) -> dict:
+        actor = self._actor(actor, role, {"qa"})
+        signal = self._row("quality_signals", signal_id)
+        batch = self._row("batches", signal["batch_id"])
+        if signal["status"] != "pending": raise ApiError(409, "信号已经完成复评")
+        if action not in ASSESS_ACTIONS: raise ApiError(400, "复评结论不合法")
+        if not reason.strip(): raise ApiError(400, "必须填写复评原因")
+        if int(expected_revision) != int(batch["revision"]): raise ApiError(409, "批次版本已变化，请重新加载后再复评")
+        state = batch["state"]
+        if action == "maintain":
+            if state != "released": raise ApiError(409, "批次已不在放行状态，不能维持放行")
+            new_state = "released"
+        elif action == "investigate":
+            if state == "revoked": raise ApiError(409, "批次已撤销放行，不能转回调查")
+            new_state = "investigation"
+        else:
+            new_state = "revoked"
+        stamp = now()
+        with self.conn:
+            if action in {"investigate", "revoke"}:
+                release = self.conn.execute("""SELECT * FROM decisions WHERE batch_id=? AND decision='release' AND voided_at IS NULL
+                                             ORDER BY id DESC LIMIT 1""", (batch["id"],)).fetchone()
+                if release:
+                    self.conn.execute("UPDATE decisions SET voided_by=?,voided_at=?,void_reason=? WHERE id=?",
+                                      (actor, stamp, reason, release["id"]))
+            self.conn.execute("""UPDATE quality_signals SET status='assessed',assessment=?,assessment_reason=?,assessed_by=?,assessed_at=?
+                               WHERE id=? AND status='pending'""", (action, reason, actor, stamp, signal_id))
+            updated = self.conn.execute("UPDATE batches SET state=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",
+                                        (new_state, stamp, batch["id"], expected_revision))
+            if updated.rowcount != 1: raise ApiError(409, "批次版本已变化，请重新加载后再复评")
+            self.store.audit(actor, "signal.assess", "signal", signal_id,
+                             {"batch_id": batch["id"], "action": action, "state": new_state})
+        return {"signal": self._signal_dict(self._row("quality_signals", signal_id)), "batch": self.batch_detail(batch["id"])["batch"]}
+
     def _advance_batch(self, batch_id: int, expected_revision: int, next_state: str) -> None:
         batch = self._row("batches", batch_id)
-        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "终态批次不可修改")
+        if batch["state"] in TERMINAL_STATES: raise ApiError(409, "终态批次不可修改")
         if int(expected_revision) != int(batch["revision"]): raise ApiError(409, "批次版本冲突")
         cur = self.conn.execute("UPDATE batches SET state=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",
                                 (next_state, now(), batch_id, expected_revision))
         if cur.rowcount != 1: raise ApiError(409, "并发更新冲突")
 
+    def _touch_batch(self, batch_id: int, expected_revision: int) -> None:
+        batch = self._row("batches", batch_id)
+        if int(expected_revision) != int(batch["revision"]): raise ApiError(409, "批次版本冲突")
+        cur = self.conn.execute("UPDATE batches SET revision=revision+1,updated_at=? WHERE id=? AND revision=?",
+                                (now(), batch_id, expected_revision))
+        if cur.rowcount != 1: raise ApiError(409, "并发更新冲突")
+
     def batch_detail(self, batch_id: int) -> dict:
         batch = self._batch_dict(self._row("batches", batch_id))
         def rows(name: str) -> list[dict]: return [dict(row) for row in self.conn.execute(f"SELECT * FROM {name} WHERE batch_id=? ORDER BY id", (batch_id,))]
+        signals = [self._signal_dict(row) for row in self.conn.execute("SELECT * FROM quality_signals WHERE batch_id=? ORDER BY id", (batch_id,))]
+        batch["frozen"] = any(s["status"] == "pending" for s in signals)
         return {"batch": batch, "deviations": rows("deviations"), "tests": rows("tests"), "rework": rows("rework"),
                 "supplier_changes": rows("supplier_changes"), "stability": rows("stability"),
-                "decisions": rows("decisions")}
+                "decisions": rows("decisions"), "signals": signals}
 
     def _batch_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "factory_id": row["factory_id"], "batch_no": row["batch_no"], "product": row["product"],
@@ -306,6 +409,14 @@ class BatchService:
     def _test_dict(row: sqlite3.Row) -> dict:
         return {"id": row["id"], "batch_id": row["batch_id"], "test_type": row["test_type"], "result": row["result"],
                 "spec_min": row["spec_min"], "spec_max": row["spec_max"], "passed": bool(row["passed"]), "round": row["round"]}
+
+    @staticmethod
+    def _signal_dict(row: sqlite3.Row) -> dict:
+        return {"id": row["id"], "batch_id": row["batch_id"], "signal_type": row["signal_type"], "source": row["source"],
+                "discovered_at": row["discovered_at"], "impact": row["impact"], "status": row["status"],
+                "assessment": row["assessment"], "assessment_reason": row["assessment_reason"],
+                "assessed_by": row["assessed_by"], "assessed_at": row["assessed_at"],
+                "created_by": row["created_by"], "created_at": row["created_at"]}
 
     def state(self) -> dict:
         return {"factories": [dict(row) for row in self.conn.execute("SELECT * FROM factories ORDER BY id")],
@@ -356,6 +467,8 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "supplier-changes": out = self.service.record_supplier_change(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("supplier", ""), b.get("change_type", ""), b.get("description", ""), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "stability": out = self.service.record_stability(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("condition", ""), b.get("timepoint", ""), float(b.get("result", 0)), float(b.get("spec_limit", 0)), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "decide": out = self.service.decide(actor, role, int(p[2]), b.get("decision", ""), b.get("rationale", ""), int(b.get("expected_revision", -1)), b.get("exception_code", ""))
+            elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "signals": out = self.service.register_signal(actor, role, int(p[2]), b.get("signal_type", ""), b.get("source", ""), b.get("discovered_at", ""), b.get("impact", ""), int(b.get("expected_revision", -1)))
+            elif len(p) == 4 and p[:2] == ["api", "signals"] and p[3] == "assess": out = self.service.assess_signal(actor, role, int(p[2]), b.get("action", ""), b.get("reason", ""), int(b.get("expected_revision", -1)))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})

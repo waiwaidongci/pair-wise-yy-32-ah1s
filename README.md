@@ -2,6 +2,8 @@
 
 Python 标准库 + SQLite。批次可关联关键/一般偏差、检验复测、返工、供应商变更和稳定性数据。质量人员可以拒绝、再取样、有条件放行或正式放行；关键偏差始终阻止正式放行，修改必须携带当前批次修订号。
 
+正式放行后若发现检验复测不合格或稳定性超限，QA 可登记上市后质量信号（类型、来源、发现时间、影响说明）；待评估信号会冻结批次，后续质量决定先被拦下。QA 复评信号可维持放行、转回调查或撤销放行（批次进入 `revoked` 终态）；转回或撤销会使原放行决定失效并记录原因，批次详情同时展示信号、原决定和处置结果。
+
 ## 运行
 
 ```bash
@@ -20,6 +22,8 @@ python3 app.py
 - `POST /api/batches/{id}/rework`、`POST /api/rework/{id}/complete`：计划和完成返工。
 - `POST /api/batches/{id}/supplier-changes`、`POST /api/batches/{id}/stability`：关联供应链和稳定性记录。
 - `POST /api/batches/{id}/decide`：质量决定，支持并发修订号检查。
+- `POST /api/batches/{id}/signals`：QA 登记上市后质量信号，待评估信号冻结批次。
+- `POST /api/signals/{id}/assess`：QA 复评信号（`maintain`/`investigate`/`revoke`），后两者使原放行决定失效。
 - `GET /api/batches/{id}`、`GET /api/state`、`GET /api/health`：详情、状态和健康检查。
 
 ## 测试

@@ -1,1 +1,96 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>药品生产偏差与批次放行</h1><p>偏差、检验、返工、供应商变更和稳定性数据共同约束质量放行。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title>
+<style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}
+pre{background:#f3f5f7;padding:16px;overflow:auto;max-height:300px}
+button{padding:8px 14px;margin:2px}
+table{border-collapse:collapse;margin:8px 0}td,th{border:1px solid #ccc;padding:4px 8px;font-size:14px;text-align:left}
+section{border:1px solid #ddd;padding:12px;margin:12px 0}
+input,select,textarea{padding:6px;margin:4px 6px 4px 0}
+.frozen{color:#b00020;font-weight:700}
+.void{color:#b00020}
+#msg{color:#b00020;min-height:1.2em}
+</style>
+<h1>药品生产偏差与批次放行</h1>
+<p>正式放行后发现的检验复测不合格或稳定性超限，由 QA 登记上市后质量信号；待评估信号冻结批次，复评可维持放行、转回调查或撤销放行。</p>
+<div>
+<label>身份 <input id="actor" value="qa-demo"></label>
+<label>角色 <select id="role"><option value="qa">qa</option><option value="operator">operator</option><option value="inspector">inspector</option><option value="lab">lab</option></select></label>
+<button onclick="loadState()">刷新状态</button>
+</div>
+<div id="batches"></div>
+<pre id="state">加载中...</pre>
+<section id="detail" hidden>
+<h2 id="dtitle"></h2>
+<div id="dinfo"></div>
+<h3>上市后质量信号</h3>
+<div id="dsignals"></div>
+<div id="signalform">
+<h4>登记信号（QA）</h4>
+<select id="stype"><option value="retest_failure">检验复测不合格</option><option value="stability_oor">稳定性超限</option><option value="other">其他</option></select>
+<input id="ssource" placeholder="来源（抽检/投诉/留样复测）" size="22">
+<input id="stime" type="datetime-local">
+<input id="simpact" placeholder="影响说明" size="40">
+<button onclick="registerSignal()">登记并冻结批次</button>
+</div>
+<h3>质量决定</h3>
+<div id="ddecisions"></div>
+<div id="msg"></div>
+</section>
+<script>
+const $=id=>document.getElementById(id);
+let curBatch=null,curDetail=null;
+const SIG={retest_failure:'检验复测不合格',stability_oor:'稳定性超限',other:'其他'};
+const ACT={maintain:'维持放行',investigate:'转回调查',revoke:'撤销放行'};
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function hdrs(){return{'Content-Type':'application/json','X-Actor':$('actor').value,'X-Role':$('role').value}}
+async function post(path,body){
+  const r=await fetch(path,{method:'POST',headers:hdrs(),body:JSON.stringify(body)});
+  const d=await r.json();
+  if(!r.ok){const e=new Error(d.error||'请求失败');e.status=r.status;throw e}
+  return d;
+}
+async function loadState(){
+  const s=await (await fetch('/api/state')).json();
+  $('state').textContent=JSON.stringify(s,null,2);
+  $('batches').innerHTML=s.batches.map(b=>`<button onclick="loadBatch(${b.id})">${esc(b.batch_no)} · ${b.state}</button>`).join('');
+  if(curBatch)loadBatch(curBatch,false);
+}
+async function loadBatch(id,notice=true){
+  curDetail=await (await fetch('/api/batches/'+id)).json();
+  curBatch=id;const b=curDetail.batch,d=curDetail;
+  $('detail').hidden=false;
+  $('dtitle').textContent=`批次 ${b.batch_no}（${b.product}）`;
+  $('dinfo').innerHTML=`状态：<b>${b.state}</b> ${b.frozen?'<span class="frozen">· 已冻结（待评估信号，后续决定先停下）</span>':''} · 修订号 ${b.revision}`;
+  $('signalform').style.display=b.state==='released'?'block':'none';
+  if(!$('stime').value)$('stime').value=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);
+  $('dsignals').innerHTML=d.signals.length?'<table><tr><th>ID</th><th>类型</th><th>来源</th><th>发现时间</th><th>影响说明</th><th>状态</th><th>复评处置</th><th></th></tr>'+
+    d.signals.map(s=>`<tr><td>${s.id}</td><td>${SIG[s.signal_type]||esc(s.signal_type)}</td><td>${esc(s.source)}</td><td>${esc(s.discovered_at)}</td><td>${esc(s.impact)}</td>
+    <td>${s.status==='pending'?'待评估':'已复评'}</td>
+    <td>${s.assessment?`${ACT[s.assessment]}：${esc(s.assessment_reason||'')}（${esc(s.assessed_by)}）`:''}</td>
+    <td>${s.status==='pending'?`<select id="act${s.id}"><option value="maintain">维持放行</option><option value="investigate">转回调查</option><option value="revoke">撤销放行</option></select>
+      <input id="reason${s.id}" placeholder="复评原因（必填）" size="20"><button onclick="assess(${s.id})">提交复评</button>`:''}</td></tr>`).join('')+'</table>':'暂无信号';
+  $('ddecisions').innerHTML=d.decisions.length?'<table><tr><th>ID</th><th>修订号</th><th>决定</th><th>依据</th><th>决定人</th><th>状态</th></tr>'+
+    d.decisions.map(x=>`<tr><td>${x.id}</td><td>${x.revision}</td><td>${x.decision}</td><td>${esc(x.rationale)}</td><td>${esc(x.decided_by)}</td>
+    <td>${x.voided_at?`<span class="void">已失效：${esc(x.void_reason)}（${esc(x.voided_by)}，${x.voided_at}）</span>`:'有效'}</td></tr>`).join('')+'</table>':'暂无决定';
+  if(notice)$('msg').textContent='';
+}
+async function run(fn){
+  try{await fn();await loadState()}
+  catch(e){
+    if(e.status===409&&curBatch){await loadBatch(curBatch,false);$('msg').textContent=`${e.message}（批次版本已变化，页面已重新加载，请再次确认）`}
+    else $('msg').textContent=e.message;
+  }
+}
+function registerSignal(){
+  const body={signal_type:$('stype').value,source:$('ssource').value,
+    discovered_at:$('stime').value?new Date($('stime').value).toISOString():'',
+    impact:$('simpact').value,expected_revision:curDetail.batch.revision};
+  run(()=>post('/api/batches/'+curBatch+'/signals',body));
+}
+function assess(id){
+  const body={action:$('act'+id).value,reason:$('reason'+id).value,expected_revision:curDetail.batch.revision};
+  run(()=>post('/api/signals/'+id+'/assess',body));
+}
+loadState();
+</script>
+</html>
