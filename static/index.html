@@ -1,1 +1,128 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>药品生产偏差与批次放行</h1><p>偏差、检验、返工、供应商变更和稳定性数据共同约束质量放行。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title><style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}
+pre{background:#f3f5f7;padding:16px;overflow:auto}
+button{padding:8px 14px;margin:2px}
+input,select,textarea{padding:6px;margin:4px 4px 4px 0}
+textarea{width:100%;min-height:48px}
+table{border-collapse:collapse;width:100%;margin:8px 0}
+td,th{border:1px solid #ccc;padding:6px 8px;text-align:left;font-size:14px}
+section{border:1px solid #ddd;border-radius:8px;padding:16px;margin:16px 0}
+.frozen{color:#b00020;font-weight:700}
+.voided{color:#b00020}
+.msg{min-height:1.4em;color:#066}
+.err{color:#b00020}
+</style>
+<h1>药品生产偏差与批次放行</h1>
+<p>偏差、检验、返工、供应商变更和稳定性数据共同约束质量放行；正式放行后发现的上市后质量信号会冻结批次，由 QA 复评处置。</p>
+<section>
+  身份 <input id="actor" value="qa"> 角色 <input id="role" value="qa">
+  <button onclick="loadState()">刷新状态</button>
+  <pre id="state">加载中...</pre>
+</section>
+<section>
+  <h2>批次详情</h2>
+  批次 ID <input id="batchId" type="number" min="1" value="1">
+  <button onclick="loadDetail()">加载详情</button>
+  <div id="detail"></div>
+</section>
+<section>
+  <h2>登记上市后质量信号(QA)</h2>
+  <div>
+    类型 <select id="sigType">
+      <option value="retest_failure">检验复测不合格</option>
+      <option value="stability_oor">稳定性超限</option>
+      <option value="other">其他</option>
+    </select>
+    来源 <input id="sigSource" placeholder="如:留样复测 / 投诉 / 稳定性考察">
+    发现时间 <input id="sigFoundAt" type="datetime-local">
+  </div>
+  <textarea id="sigImpact" placeholder="影响说明"></textarea>
+  <div><button onclick="registerSignal()">登记信号(冻结批次)</button></div>
+  <div class="msg" id="sigMsg"></div>
+</section>
+<script>
+let detail = null;
+const $ = id => document.getElementById(id);
+function show(el, text, isErr){ el.textContent = text; el.className = isErr ? 'msg err' : 'msg'; }
+async function api(path, body){
+  const res = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json','X-Actor':$('actor').value,'X-Role':$('role').value}, body:JSON.stringify(body||{})});
+  const data = await res.json();
+  if(!res.ok){ const e = new Error(data.error || res.status); e.status = res.status; throw e; }
+  return data;
+}
+async function loadState(){ $('state').textContent = JSON.stringify(await (await fetch('/api/state')).json(), null, 2); }
+const SIG_TYPE = {retest_failure:'检验复测不合格', stability_oor:'稳定性超限', other:'其他'};
+const SIG_STATUS = {pending:'待评估', maintained:'维持放行', returned:'转回调查', rescinded:'撤销放行'};
+const DECISION = {release:'正式放行', reject:'拒绝', conditional:'有条件放行', resample:'再取样'};
+async function loadDetail(){
+  try{
+    detail = await (await fetch('/api/batches/' + $('batchId').value)).json();
+    if(detail.error){ $('detail').innerHTML = '<p class="err">' + detail.error + '</p>'; detail = null; return; }
+    renderDetail();
+  }catch(e){ $('detail').innerHTML = '<p class="err">' + e.message + '</p>'; }
+}
+function renderDetail(){
+  const b = detail.batch;
+  let html = '<p>批号 <b>' + b.batch_no + '</b>(' + b.product + ') 状态 <b>' + b.state + '</b> 修订号 ' + b.revision
+    + (b.frozen ? ' <span class="frozen">● 待评估信号冻结中,后续决定已停下</span>' : '') + '</p>';
+  html += '<h3>上市后质量信号</h3>';
+  if(!detail.signals.length) html += '<p>无</p>';
+  else{
+    html += '<table><tr><th>ID</th><th>类型</th><th>来源</th><th>发现时间</th><th>影响</th><th>状态/处置</th><th>操作</th></tr>';
+    for(const s of detail.signals){
+      html += '<tr><td>' + s.id + '</td><td>' + SIG_TYPE[s.signal_type] + '</td><td>' + s.source + '</td><td>' + s.found_at + '</td><td>' + s.impact + '</td><td>'
+        + SIG_STATUS[s.status] + (s.review_reason ? '<br>原因:' + s.review_reason : '') + (s.reviewed_by ? '<br>' + s.reviewed_by + ' @ ' + s.reviewed_at : '') + '</td><td>'
+        + (s.status === 'pending'
+          ? '<button onclick="review(' + s.id + ',\'maintain\')">维持放行</button>'
+          + '<button onclick="review(' + s.id + ',\'return\')">转回调查</button>'
+          + '<button onclick="review(' + s.id + ',\'rescind\')">撤销放行</button>'
+          : '') + '</td></tr>';
+    }
+    html += '</table>';
+  }
+  html += '<h3>质量决定(含失效处置)</h3>';
+  if(!detail.decisions.length) html += '<p>无</p>';
+  else{
+    html += '<table><tr><th>ID</th><th>决定</th><th>依据</th><th>决定人</th><th>状态</th></tr>';
+    for(const d of detail.decisions){
+      const voided = d.invalidated_at !== null && d.invalidated_at !== undefined;
+      html += '<tr><td>' + d.id + '</td><td>' + DECISION[d.decision] + '</td><td>' + d.rationale + '</td><td>' + d.decided_by + '</td><td>'
+        + (voided ? '<span class="voided">已失效</span><br>原因:' + d.invalidation_reason + '<br>' + d.invalidated_by + ' @ ' + d.invalidated_at : '有效')
+        + '</td></tr>';
+    }
+    html += '</table>';
+  }
+  $('detail').innerHTML = html;
+}
+async function registerSignal(){
+  if(!detail){ show($('sigMsg'), '请先加载批次详情', true); return; }
+  try{
+    await api('/api/batches/' + detail.batch.id + '/signals', {
+      signal_type: $('sigType').value, source: $('sigSource').value,
+      found_at: $('sigFoundAt').value, impact: $('sigImpact').value,
+      expected_revision: detail.batch.revision
+    });
+    show($('sigMsg'), '信号已登记,批次已冻结,等待 QA 复评');
+    await loadDetail(); await loadState();
+  }catch(e){
+    show($('sigMsg'), e.message, true);
+    if(e.status === 409) await loadDetail();
+  }
+}
+async function review(signalId, action){
+  if(!detail){ return; }
+  let reason = '';
+  if(action !== 'maintain'){
+    reason = prompt(action === 'return' ? '转回调查原因(原放行决定将失效):' : '撤销放行原因(原放行决定将失效):') || '';
+    if(!reason.trim()){ alert('转回调查或撤销放行必须填写原因'); return; }
+  }
+  try{
+    await api('/api/signals/' + signalId + '/review', {action, reason, expected_revision: detail.batch.revision});
+    await loadDetail(); await loadState();
+  }catch(e){
+    alert(e.message);
+    if(e.status === 409) await loadDetail(); // 版本变过就重新加载
+  }
+}
+loadState();
+</script></html>

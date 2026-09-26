@@ -27,6 +27,16 @@ def after_now(value: str | None = None) -> bool:
         return False
 
 
+def valid_timestamp(value: str | None) -> bool:
+    if not value or not value.strip():
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return True
+    except ValueError:
+        return False
+
+
 def j(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
@@ -84,13 +94,27 @@ class Store:
         CREATE TABLE IF NOT EXISTS decisions (
           id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER NOT NULL REFERENCES batches(id), revision INTEGER NOT NULL,
           decision TEXT NOT NULL CHECK(decision IN ('release','reject','conditional','resample')), rationale TEXT NOT NULL,
-          exception_code TEXT, decided_by TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(batch_id,revision)
+          exception_code TEXT, decided_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          invalidated_by TEXT, invalidated_at TEXT, invalidation_reason TEXT, UNIQUE(batch_id,revision)
+        );
+        CREATE TABLE IF NOT EXISTS signals (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER NOT NULL REFERENCES batches(id),
+          signal_type TEXT NOT NULL CHECK(signal_type IN ('retest_failure','stability_oor','other')),
+          source TEXT NOT NULL, found_at TEXT NOT NULL, impact TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('pending','maintained','returned','rescinded')) DEFAULT 'pending',
+          review_reason TEXT, reviewed_by TEXT, reviewed_at TEXT,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS audit_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
         """)
+        decision_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(decisions)")}
+        for column, ddl in {"invalidated_by": "invalidated_by TEXT", "invalidated_at": "invalidated_at TEXT",
+                            "invalidation_reason": "invalidation_reason TEXT"}.items():
+            if column not in decision_cols:
+                self.conn.execute(f"ALTER TABLE decisions ADD COLUMN {ddl}")
         self.conn.commit()
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
@@ -102,6 +126,9 @@ class Store:
 
 
 class BatchService:
+    SIGNAL_TYPES = {"retest_failure", "stability_oor", "other"}
+    REVIEW_ACTIONS = {"maintain", "return", "rescind"}
+
     def __init__(self, store: Store): self.store, self.conn = store, store.conn
 
     @staticmethod
@@ -240,6 +267,7 @@ class BatchService:
         batch = self._row("batches", batch_id)
         if decision not in {"release", "reject", "conditional", "resample"}: raise ApiError(400, "放行决定不合法")
         if batch["state"] in {"released", "rejected"}: raise ApiError(409, "批次已经是终态")
+        if self._pending_signal(batch_id): raise ApiError(409, "存在待评估的上市后质量信号，批次已冻结，后续决定先停下")
         if int(expected_revision) != int(batch["revision"]): raise ApiError(409, "批次已被其他工厂或质量人员修改，请刷新版本")
         if not rationale.strip(): raise ApiError(400, "必须填写决定依据")
         deviations = self.conn.execute("SELECT * FROM deviations WHERE batch_id=? ORDER BY id", (batch_id,)).fetchall()
@@ -277,6 +305,56 @@ class BatchService:
             self.store.audit(actor, "batch.decision", "batch", batch_id, {"decision": decision, "revision": batch["revision"], "state": new_state, "exception_code": exception_code})
         return {"decision": dict(self._row("decisions", cur.lastrowid)), "batch": self.batch_detail(batch_id)["batch"]}
 
+    def _pending_signal(self, batch_id: int) -> bool:
+        return bool(self.conn.execute("SELECT 1 FROM signals WHERE batch_id=? AND status='pending'", (batch_id,)).fetchone())
+
+    def register_signal(self, actor: str | None, role: str | None, batch_id: int, signal_type: str, source: str, found_at: str, impact: str, expected_revision: int) -> dict:
+        actor = self._actor(actor, role, {"qa"})
+        batch = self._row("batches", batch_id)
+        if batch["state"] != "released": raise ApiError(409, "仅正式放行的批次可登记上市后质量信号")
+        if signal_type not in self.SIGNAL_TYPES: raise ApiError(400, "信号类型不合法")
+        if not source.strip() or not impact.strip(): raise ApiError(400, "信号来源和影响说明不能为空")
+        if not valid_timestamp(found_at): raise ApiError(400, "发现时间不合法")
+        if int(expected_revision) != int(batch["revision"]): raise ApiError(409, "批次版本冲突，请重新加载")
+        if self._pending_signal(batch_id): raise ApiError(409, "已存在待评估信号，批次处于冻结状态")
+        with self.conn:
+            cur = self.conn.execute("""INSERT INTO signals(batch_id,signal_type,source,found_at,impact,status,created_by,created_at)
+                                     VALUES(?,?,?,?,?,'pending',?,?)""", (batch_id, signal_type, source, found_at, impact, actor, now()))
+            updated = self.conn.execute("UPDATE batches SET revision=revision+1,updated_at=? WHERE id=? AND revision=?",
+                                        (now(), batch_id, expected_revision))
+            if updated.rowcount != 1: raise ApiError(409, "并发更新冲突")
+            self.store.audit(actor, "signal.register", "signal", cur.lastrowid,
+                             {"batch_id": batch_id, "signal_type": signal_type, "source": source, "found_at": found_at})
+        return self._signal_dict(self._row("signals", cur.lastrowid))
+
+    def review_signal(self, actor: str | None, role: str | None, signal_id: int, action: str, reason: str, expected_revision: int) -> dict:
+        actor = self._actor(actor, role, {"qa"})
+        signal = self._row("signals", signal_id); batch = self._row("batches", signal["batch_id"])
+        if action not in self.REVIEW_ACTIONS: raise ApiError(400, "复评处置不合法")
+        if signal["status"] != "pending": raise ApiError(409, "信号已复评，不能重复处置")
+        if int(expected_revision) != int(batch["revision"]): raise ApiError(409, "批次版本已变化，请重新加载后再复评")
+        if action in {"return", "rescind"} and not reason.strip(): raise ApiError(400, "转回调查或撤销放行必须填写原因")
+        new_status = {"maintain": "maintained", "return": "returned", "rescind": "rescinded"}[action]
+        new_state = {"maintain": "released", "return": "investigation", "rescind": "rejected"}[action]
+        with self.conn:
+            updated_signal = self.conn.execute("UPDATE signals SET status=?,review_reason=?,reviewed_by=?,reviewed_at=? WHERE id=? AND status='pending'",
+                                               (new_status, reason or None, actor, now(), signal_id))
+            if updated_signal.rowcount != 1: raise ApiError(409, "信号已被其他人复评")
+            invalidated_id = None
+            if action in {"return", "rescind"}:
+                decision = self.conn.execute("""SELECT * FROM decisions WHERE batch_id=? AND decision='release' AND invalidated_at IS NULL
+                                              ORDER BY id DESC LIMIT 1""", (batch["id"],)).fetchone()
+                if decision:
+                    self.conn.execute("UPDATE decisions SET invalidated_by=?,invalidated_at=?,invalidation_reason=? WHERE id=?",
+                                      (actor, now(), reason, decision["id"]))
+                    invalidated_id = decision["id"]
+            updated = self.conn.execute("UPDATE batches SET state=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",
+                                        (new_state, now(), batch["id"], expected_revision))
+            if updated.rowcount != 1: raise ApiError(409, "并发更新冲突")
+            self.store.audit(actor, "signal.review", "signal", signal_id,
+                             {"batch_id": batch["id"], "action": action, "state": new_state, "invalidated_decision": invalidated_id, "reason": reason})
+        return {"signal": self._signal_dict(self._row("signals", signal_id)), "batch": self.batch_detail(batch["id"])["batch"]}
+
     def _advance_batch(self, batch_id: int, expected_revision: int, next_state: str) -> None:
         batch = self._row("batches", batch_id)
         if batch["state"] in {"released", "rejected"}: raise ApiError(409, "终态批次不可修改")
@@ -290,11 +368,12 @@ class BatchService:
         def rows(name: str) -> list[dict]: return [dict(row) for row in self.conn.execute(f"SELECT * FROM {name} WHERE batch_id=? ORDER BY id", (batch_id,))]
         return {"batch": batch, "deviations": rows("deviations"), "tests": rows("tests"), "rework": rows("rework"),
                 "supplier_changes": rows("supplier_changes"), "stability": rows("stability"),
-                "decisions": rows("decisions")}
+                "decisions": rows("decisions"), "signals": rows("signals")}
 
     def _batch_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "factory_id": row["factory_id"], "batch_no": row["batch_no"], "product": row["product"],
-                "mfg_date": row["mfg_date"], "expiry_date": row["expiry_date"], "state": row["state"], "revision": row["revision"]}
+                "mfg_date": row["mfg_date"], "expiry_date": row["expiry_date"], "state": row["state"], "revision": row["revision"],
+                "frozen": self._pending_signal(row["id"])}
 
     @staticmethod
     def _deviation_dict(row: sqlite3.Row) -> dict:
@@ -306,6 +385,13 @@ class BatchService:
     def _test_dict(row: sqlite3.Row) -> dict:
         return {"id": row["id"], "batch_id": row["batch_id"], "test_type": row["test_type"], "result": row["result"],
                 "spec_min": row["spec_min"], "spec_max": row["spec_max"], "passed": bool(row["passed"]), "round": row["round"]}
+
+    @staticmethod
+    def _signal_dict(row: sqlite3.Row) -> dict:
+        return {"id": row["id"], "batch_id": row["batch_id"], "signal_type": row["signal_type"], "source": row["source"],
+                "found_at": row["found_at"], "impact": row["impact"], "status": row["status"],
+                "review_reason": row["review_reason"], "reviewed_by": row["reviewed_by"], "reviewed_at": row["reviewed_at"],
+                "created_by": row["created_by"], "created_at": row["created_at"]}
 
     def state(self) -> dict:
         return {"factories": [dict(row) for row in self.conn.execute("SELECT * FROM factories ORDER BY id")],
@@ -356,6 +442,8 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "supplier-changes": out = self.service.record_supplier_change(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("supplier", ""), b.get("change_type", ""), b.get("description", ""), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "stability": out = self.service.record_stability(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("condition", ""), b.get("timepoint", ""), float(b.get("result", 0)), float(b.get("spec_limit", 0)), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "decide": out = self.service.decide(actor, role, int(p[2]), b.get("decision", ""), b.get("rationale", ""), int(b.get("expected_revision", -1)), b.get("exception_code", ""))
+            elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "signals": out = self.service.register_signal(actor, role, int(p[2]), b.get("signal_type", ""), b.get("source", ""), b.get("found_at", ""), b.get("impact", ""), int(b.get("expected_revision", -1)))
+            elif len(p) == 4 and p[:2] == ["api", "signals"] and p[3] == "review": out = self.service.review_signal(actor, role, int(p[2]), b.get("action", ""), b.get("reason", ""), int(b.get("expected_revision", -1)))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})

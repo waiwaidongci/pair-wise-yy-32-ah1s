@@ -20,7 +20,9 @@ python3 app.py
 - `POST /api/batches/{id}/rework`、`POST /api/rework/{id}/complete`：计划和完成返工。
 - `POST /api/batches/{id}/supplier-changes`、`POST /api/batches/{id}/stability`：关联供应链和稳定性记录。
 - `POST /api/batches/{id}/decide`：质量决定，支持并发修订号检查。
-- `GET /api/batches/{id}`、`GET /api/state`、`GET /api/health`：详情、状态和健康检查。
+- `POST /api/batches/{id}/signals`：QA 登记上市后质量信号（类型、来源、发现时间、影响说明），仅正式放行批次可登记，待评估信号冻结批次、后续决定先停下。
+- `POST /api/signals/{id}/review`：QA 复评信号，可维持放行、转回调查或撤销放行；转回或撤销使原放行决定失效并留下原因，复评携带批次修订号，版本变化需重新加载。
+- `GET /api/batches/{id}`、`GET /api/state`、`GET /api/health`：详情（含信号、原决定和处置）、状态和健康检查。
 
 ## 测试
 
